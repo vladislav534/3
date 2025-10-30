@@ -33,7 +33,18 @@ PAIRS_ALTERNATIVES.update({
 })
 
 API_KEYS = {}
-
+import os
 REQUEST_TIMEOUT = 20_000  # ms
 MAX_CONCURRENT_REQUESTS = 4
 PERCENT_DECIMALS = 4
+POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "1.0"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
+MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "20"))
+PERCENT_DECIMALS = int(os.getenv("PERCENT_DECIMALS", "4"))
+
+# Redis snapshot config (fast path for realtime prices)
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+# If enabled, server first tries to read snapshots from Redis before falling back to REST
+USE_REDIS_SNAPSHOT = os.getenv("USE_REDIS_SNAPSHOT", "1") == "1"
+# how fresh snapshot must be (ms)
+SNAPSHOT_MAX_AGE_MS = int(os.getenv("SNAPSHOT_MAX_AGE_MS", "500"))
