@@ -1,0 +1,528 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <title>12x12 Price Comparison</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+         :root {
+            --cell-size: 80px;
+            /* будет перезаписано JS */
+            --gutter: 6px;
+            --font-size: 13px;
+            --red: #c0392b;
+            --green: #16a085;
+            --bg: #ffffff;
+            --muted: #999;
+            --header-bg: #f2f2f2;
+        }
+        
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+            background: var(--bg);
+            color: #111;
+            font-family: Arial, sans-serif;
+            font-size: var(--font-size);
+        }
+        
+        .page {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            box-sizing: border-box;
+            padding: 12px;
+            gap: 10px;
+        }
+        
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+        
+        header .left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        header h3 {
+            margin: 0;
+            font-size: 16px;
+        }
+        
+        .controls {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+        
+        .controls input {
+            padding: 6px;
+            font-size: 13px;
+        }
+        
+        .status {
+            font-size: 13px;
+            color: var(--muted);
+        }
+        
+        main {
+            display: flex;
+            gap: 12px;
+            align-items: flex-start;
+            flex: 1 1 auto;
+            min-height: 0;
+        }
+        /* table wrapper will be scrollable if absolutely necessary */
+        
+        #tableContainer {
+            flex: 1 1 auto;
+            min-width: 0;
+            min-height: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: auto;
+            background: transparent;
+        }
+        
+        table.grid {
+            border-collapse: collapse;
+            display: inline-table;
+            /* dimensions are controlled by JS via --cell-size */
+        }
+        
+        table.grid thead th,
+        table.grid tbody th,
+        table.grid td {
+            box-sizing: border-box;
+            width: var(--cell-size);
+            height: var(--cell-size);
+            padding: 6px;
+            text-align: center;
+            vertical-align: middle;
+            border: 1px solid #ddd;
+            white-space: pre-line;
+            overflow: hidden;
+            font-size: 13px;
+        }
+        
+        table.grid thead th {
+            background: var(--header-bg);
+            font-weight: 600;
+            position: sticky;
+            top: 0;
+            z-index: 2;
+        }
+        
+        table.grid tbody th {
+            background: #fafafa;
+            position: sticky;
+            left: 0;
+            z-index: 1;
+            text-align: left;
+            padding-left: 8px;
+        }
+        
+        td.red {
+            color: var(--red);
+            font-weight: 600;
+        }
+        
+        td.green {
+            color: var(--green);
+            font-weight: 600;
+        }
+        
+        td.empty {
+            opacity: 0.45;
+            color: var(--muted);
+        }
+        /* Right panel with stats */
+        
+        aside#panel {
+            width: 300px;
+            max-width: 35%;
+            min-width: 220px;
+            box-shadow: 0 0 6px rgba(0, 0, 0, 0.06);
+            border-radius: 6px;
+            padding: 10px;
+            background: #fff;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        
+        #maxIndicator {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        
+        #maxIndicator .label {
+            color: var(--muted);
+            font-size: 12px;
+        }
+        
+        #maxIndicator .value {
+            font-size: 18px;
+            font-weight: 700;
+        }
+        
+        #maxIndicator .meta {
+            font-size: 12px;
+            color: var(--muted);
+        }
+        /* responsive */
+        
+        @media (max-width:900px) {
+            aside#panel {
+                display: none;
+            }
+            /* hide panel on narrow screens to maximize table */
+        }
+    </style>
+</head>
+
+<body>
+    <div class="page">
+        <header>
+            <div class="left">
+                <h3>12x12 Price Comparison</h3>
+                <div id="meanLine" style="margin-left:10px;color:#444;font-size:13px">Mean: N/A</div>
+            </div>
+            <div class="controls">
+                <label>Pair override:
+          <input id="pairInput" placeholder="e.g. SUI/USDT" />
+        </label>
+                <button id="setPair">Set</button>
+                <button id="clearPair">Clear</button>
+                <div class="status" id="status">Connecting...</div>
+            </div>
+        </header>
+
+        <main>
+            <div id="tableContainer">
+                <div id="tableWrap"></div>
+            </div>
+
+            <aside id="panel">
+                <div id="maxIndicator">
+                    <div class="label">Highest positive percent since start</div>
+                    <div class="value" id="maxValue">—</div>
+                    <div class="meta" id="maxMeta">waiting for data...</div>
+                </div>
+                <div>
+                    <div class="label">Current pair</div>
+                    <div id="currentPair" style="font-weight:700">—</div>
+                </div>
+                <div>
+                    <div class="label">Connected exchanges</div>
+                    <div id="exchangeCount">0</div>
+                </div>
+            </aside>
+        </main>
+    </div>
+
+    <script>
+        /*
+                                Frontend logic:
+                                - Receives messages {type: 'labels'} and {type: 'update', table, prices, pair}
+                                - Renders square N x N table; sizes computed to fit viewport
+                                - Cell value = symmetric percent of (price_column - price_row):
+                                    pct = 100 * (p_col - p_row) / ((p_col + p_row) / 2)
+                                  Positive pct -> green, Negative pct -> red
+                                - Tracks highest POSITIVE percent since start, records when it started and how long it held
+                                - Precision fixed to 4 decimals here
+                                */
+
+        const WS_URL = `ws://${location.host}/ws`;
+        const ws = new WebSocket(WS_URL);
+
+        let lastPrices = {};
+        let labels = [];
+        // track highest positive percent observed and hold info
+        let maxPositive = {
+            pct: -Infinity,
+            row: null,
+            col: null,
+            startTime: null, // when this top value began holding
+            bestDurationMs: 0, // longest continuous hold for any top value
+            bestHeldAt: null // when the longest hold began
+        };
+        const PERCENT_DECIMALS = 4; // mirrors backend config
+
+        ws.addEventListener('open', () => {
+            document.getElementById('status').innerText = 'Connected';
+        });
+
+        ws.addEventListener('message', (ev) => {
+            const msg = JSON.parse(ev.data);
+            if (msg.type === 'labels') {
+                labels = msg.labels || [];
+                document.getElementById('exchangeCount').innerText = labels.length;
+            } else if (msg.type === 'update') {
+                const table = msg.table;
+                lastPrices = msg.prices || {};
+                labels = table.labels || labels;
+                document.getElementById('currentPair').innerText = msg.pair || 'default';
+                document.getElementById('exchangeCount').innerText = labels.length;
+                render(table, lastPrices, msg.pair, table.mean);
+                updateMaxFromTable(table);
+            }
+        });
+
+        ws.addEventListener('close', () => {
+            document.getElementById('status').innerText = 'Disconnected';
+        });
+
+        /* UI controls */
+        document.getElementById('setPair').onclick = () => {
+            const p = document.getElementById('pairInput').value.trim().toUpperCase();
+            if (!p) return;
+            ws.send(JSON.stringify({
+                type: 'set_pair',
+                pair: p
+            }));
+        };
+        document.getElementById('clearPair').onclick = () => {
+            document.getElementById('pairInput').value = '';
+            ws.send(JSON.stringify({
+                type: 'clear_pair'
+            }));
+        };
+
+        /* formatting helpers */
+        function fmtPrice(v) {
+            if (v === null || v === undefined) return '-';
+            const n = Number(v);
+            if (!Number.isFinite(n)) return '-';
+            return n >= 1 ? n.toFixed(6) : n.toPrecision(6);
+        }
+
+        function fmtPct(n) {
+            if (n === null || n === undefined || !Number.isFinite(n)) return '-';
+            return `${n.toFixed(PERCENT_DECIMALS)}%`;
+        }
+
+        /* Render table and then size cells to be square and fit the viewport */
+        function render(table, prices, pair, mean) {
+            const wrap = document.getElementById('tableWrap');
+            wrap.innerHTML = '';
+            document.getElementById('meanLine').innerText = 'Mean: ' + (mean ? mean.toFixed(6) : 'N/A') + (pair ? (' | Pair: ' + pair) : '');
+
+            const tbl = document.createElement('table');
+            tbl.className = 'grid';
+            const thead = document.createElement('thead');
+            const headRow = document.createElement('tr');
+
+            // top-left empty header
+            const topLeft = document.createElement('th');
+            topLeft.innerText = 'Exchange\nPrice';
+            headRow.appendChild(topLeft);
+
+            table.labels.forEach(l => {
+                const th = document.createElement('th');
+                const p = prices && prices[l] !== undefined ? fmtPrice(prices[l]) : '-';
+                th.innerText = l + '\n' + p;
+                headRow.appendChild(th);
+            });
+            thead.appendChild(headRow);
+            tbl.appendChild(thead);
+
+            const tbody = document.createElement('tbody');
+            table.labels.forEach((rowLabel, r) => {
+                const tr = document.createElement('tr');
+                const th = document.createElement('th');
+                const rp = prices && prices[rowLabel] !== undefined ? fmtPrice(prices[rowLabel]) : '-';
+                th.innerText = rowLabel + '\n' + rp;
+                tr.appendChild(th);
+
+                table.labels.forEach((colLabel, c) => {
+                    const td = document.createElement('td');
+                    const horiz = prices && prices[colLabel] !== undefined ? Number(prices[colLabel]) : null;
+                    const vert = prices && prices[rowLabel] !== undefined ? Number(prices[rowLabel]) : null;
+                    const MIN_DENOM = 1e-9;
+                    if (horiz === null || horiz === undefined || vert === null || vert === undefined) {
+                        td.innerText = '-';
+                        td.className = 'empty';
+                    } else {
+                        const denom = (horiz + vert) / 2.0;
+                        if (!Number.isFinite(denom) || Math.abs(denom) <= MIN_DENOM) {
+                            td.innerText = '-';
+                            td.className = 'empty';
+                            td.title = 'invalid or too small denom — ignored';
+                        } else {
+                            const pct = 100.0 * (horiz - vert) / denom;
+                            td.innerText = pct.toFixed(PERCENT_DECIMALS) + '%';
+                            if (pct > 0) {
+                                td.className = 'green';
+                            } else if (pct < 0) {
+                                td.className = 'red';
+                            }
+                        }
+                    }
+                    tr.appendChild(td);
+                });
+
+                tbody.appendChild(tr);
+            });
+            tbl.appendChild(tbody);
+            wrap.appendChild(tbl);
+
+            // After element added to DOM, compute square cell size and apply
+            requestAnimationFrame(() => adjustCellSize(tbl));
+        }
+
+        /* Compute cell size so that table fits inside tableContainer and is square */
+        function adjustCellSize(tableEl) {
+            const container = document.getElementById('tableContainer');
+            const rect = container.getBoundingClientRect();
+
+            const n = labels.length;
+            if (n === 0) {
+                document.documentElement.style.setProperty('--cell-size', '80px');
+                return;
+            }
+
+            // compute available width and height for table, subtract left headers/gutters
+            const availableWidth = Math.max(100, rect.width - 20); // some padding
+            const availableHeight = Math.max(100, rect.height - 20); // some padding
+
+            // Need N+1 columns (left header + N columns), and N+1 rows (top header + N rows)
+            const cols = n + 1;
+            const rows = n + 1;
+
+            const maxCellW = Math.floor((availableWidth - 2) / cols);
+            const maxCellH = Math.floor((availableHeight - 2) / rows);
+
+            const cellSize = Math.max(28, Math.min(maxCellW, maxCellH)); // min size 28px
+            // set CSS variable used by table cells
+            document.documentElement.style.setProperty('--cell-size', cellSize + 'px');
+        }
+
+        /* Track highest POSITIVE percent since startup and how long it held at peak */
+        function updateMaxFromTable(table) {
+            const labelsLocal = table.labels || [];
+            const now = new Date();
+            let currentHighest = {
+                pct: -Infinity,
+                row: null,
+                col: null
+            };
+
+            for (let i = 0; i < labelsLocal.length; i++) {
+                for (let j = 0; j < labelsLocal.length; j++) {
+                    const colLabel = labelsLocal[j];
+                    const rowLabel = labelsLocal[i];
+                    const horiz = lastPrices && lastPrices[colLabel] !== undefined ? Number(lastPrices[colLabel]) : null;
+                    const vert = lastPrices && lastPrices[rowLabel] !== undefined ? Number(lastPrices[rowLabel]) : null;
+                    if (horiz === null || vert === null) continue;
+                    const denom = (horiz + vert) / 2.0;
+                    const MIN_DENOM = 1e-9;
+                    if (!Number.isFinite(denom) || Math.abs(denom) <= MIN_DENOM) continue;
+                    const pct = 100.0 * (horiz - vert) / denom;
+                    if (pct > currentHighest.pct) {
+                        currentHighest = {
+                            pct,
+                            row: rowLabel,
+                            col: colLabel
+                        };
+                    }
+                }
+            }
+
+            if (currentHighest.pct === -Infinity) {
+                // no positive values this tick
+                if (maxPositive.startTime) {
+                    // close hold
+                    const dur = now - maxPositive.startTime;
+                    if (dur > maxPositive.bestDurationMs) {
+                        maxPositive.bestDurationMs = dur;
+                        maxPositive.bestHeldAt = new Date(maxPositive.startTime);
+                    }
+                    maxPositive.startTime = null;
+                }
+                renderMaxIndicator();
+                return;
+            }
+
+            if (currentHighest.pct > (maxPositive.pct === -Infinity ? -Infinity : maxPositive.pct)) {
+                // new highest observed
+                if (maxPositive.startTime) {
+                    const dur = now - maxPositive.startTime;
+                    if (dur > maxPositive.bestDurationMs) {
+                        maxPositive.bestDurationMs = dur;
+                        maxPositive.bestHeldAt = new Date(maxPositive.startTime);
+                    }
+                }
+                maxPositive.pct = currentHighest.pct;
+                maxPositive.row = currentHighest.row;
+                maxPositive.col = currentHighest.col;
+                maxPositive.startTime = now;
+            } else if (currentHighest.pct === maxPositive.pct) {
+                // peak continues; ensure startTime is set
+                if (!maxPositive.startTime) maxPositive.startTime = now;
+            } else {
+                // current tick lower than recorded peak
+                if (maxPositive.startTime) {
+                    const dur = now - maxPositive.startTime;
+                    if (dur > maxPositive.bestDurationMs) {
+                        maxPositive.bestDurationMs = dur;
+                        maxPositive.bestHeldAt = new Date(maxPositive.startTime);
+                    }
+                    maxPositive.startTime = null;
+                }
+            }
+            renderMaxIndicator();
+        }
+
+        /* Render the highest positive percent and duration it held at peak */
+        function renderMaxIndicator() {
+            const v = document.getElementById('maxValue');
+            const m = document.getElementById('maxMeta');
+            if (maxPositive.pct === -Infinity) {
+                v.innerText = '—';
+                m.innerText = 'no positive data yet';
+                return;
+            }
+            v.innerText = `${maxPositive.pct.toFixed(PERCENT_DECIMALS)}%`;
+            let durationMs = maxPositive.bestDurationMs || 0;
+            if (maxPositive.startTime) {
+                durationMs = Math.max(durationMs, (new Date() - maxPositive.startTime));
+            }
+            const durationStr = durationMs > 0 ? msToHMS(durationMs) : '00:00:00';
+            const started = maxPositive.startTime ? new Date(maxPositive.startTime).toLocaleTimeString() :
+                (maxPositive.bestHeldAt ? new Date(maxPositive.bestHeldAt).toLocaleTimeString() : '-');
+            m.innerText = `${maxPositive.row} vs ${maxPositive.col} • started ${started} • held ${durationStr}`;
+        }
+
+        function msToHMS(ms) {
+            const s = Math.floor(ms / 1000);
+            const h = Math.floor(s / 3600);
+            const m = Math.floor((s % 3600) / 60);
+            const sec = s % 60;
+            return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+        }
+
+        /* recompute sizes on resize */
+        let resizeTimer = null;
+        window.addEventListener('resize', () => {
+            if (resizeTimer) clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => {
+                const tbl = document.querySelector('table.grid');
+                if (tbl) adjustCellSize(tbl);
+            }, 120);
+        });
+
+        /* initial call to set defaults */
+        document.documentElement.style.setProperty('--cell-size', '80px');
+    </script>
+</body>
+
+</html>
