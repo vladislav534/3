@@ -2,13 +2,16 @@
 import asyncio
 import json
 import logging
+import time
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
-from fetcher import fetch_all_prices
+from fetcher import fetch_all_prices, close_all_exchanges
 from calculator import build_pairwise_table
-from config import POLL_INTERVAL_SECONDS
+from config import POLL_INTERVAL_SECONDS, USE_REDIS_SNAPSHOT, SNAPSHOT_MAX_AGE_MS
+from redis_client import read_snapshot, list_snapshot_symbols
+from redis_client import read_snapshot, list_snapshot_symbols
 from exchanges import get_candidate_exchanges
 
 app = FastAPI()
@@ -90,12 +93,43 @@ async def poll_loop():
     global _current_pair
     while True:
         try:
-            res = await fetch_all_prices(pair_override=_current_pair)
-            labels = res.get("exchanges", [])
-            prices = res.get("prices", {})
-            mean = res.get("mean")
-            # строим КВАДРАТНУЮ попарную таблицу: одинаковые labels по строкам и столбцам
-            # используем специальную формулу из calculator.py
+            prices = {}
+            labels = []
+            mean = None
+            used_redis = False
+            if USE_REDIS_SNAPSHOT:
+                try:
+                    # list available snapshot symbols (PoC). For production replace with maintained set.
+                    symbols = await list_snapshot_symbols()
+                    now_ms = int(asyncio.get_event_loop().time() * 1000)
+                    for sym in symbols:
+                        snap = await read_snapshot(sym)
+                        if not snap:
+                            continue
+                        price = snap.get("price")
+                        ts = snap.get("ts")
+                        if price is None:
+                            continue
+                        # freshness check
+                        fresh = True
+                        if ts is not None:
+                            age = now_ms - int(ts)
+                            if age > SNAPSHOT_MAX_AGE_MS:
+                                fresh = False
+                        if fresh:
+                            prices[sym] = price
+                    if prices:
+                        labels = list(prices.keys())
+                        used_redis = True
+                except Exception:
+                    # if anything goes wrong reading Redis, fallback to REST
+                    used_redis = False
+            if not used_redis:
+                res = await fetch_all_prices(pair_override=_current_pair)
+                labels = res.get("exchanges", [])
+                prices = res.get("prices", {})
+                mean = res.get("mean")
+            # строим квадратную попарную таблицу (симметричная формула)
             table = build_pairwise_table(labels, prices)
             payload = {
                 "type": "update",
