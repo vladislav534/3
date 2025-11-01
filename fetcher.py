@@ -2,7 +2,7 @@
 import asyncio
 import logging
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any, Mapping
 
 import ccxt.async_support as ccxt
 
@@ -15,20 +15,51 @@ from config import (
 )
 
 logger = logging.getLogger("fetcher")
-logging.basicConfig(level=logging.INFO)
+# logging.basicConfig(level=logging.INFO)
 
 # cache of exchange instances to reuse across calls
 _EXCHANGES_INST: Dict[str, ccxt.Exchange] = {}
-# protect concurrent creation
 _ex_create_lock = asyncio.Lock()
+
+# markets + symbol resolution caches
+_MARKETS_CACHE: Dict[str, Dict[str, Any]] = {}          # ex.id -> markets
+_SYMBOL_MAP_CACHE: Dict[str, Dict[str, str]] = {}       # ex.id -> canonical "BASE/QUOTE" -> exchange symbol
+import re
+
+def _sanitize_error_message(exc: Exception, max_len: int = 200) -> str:
+    """
+    Return a short, safe string for logging from an exception.
+    - prefer short exception type + message
+    - strip HTML tags if present
+    - truncate to max_len
+    """
+    if exc is None:
+        return ""
+    msg = ""
+    try:
+        msg = str(exc)
+    except Exception:
+        msg = repr(exc)
+
+    # strip obvious HTML tags — leaves plain text if possible
+    try:
+        # remove tags
+        msg_nohtml = re.sub(r"<[^>]+>", "", msg)
+        # collapse whitespace/newlines
+        msg_nohtml = re.sub(r"\s+", " ", msg_nohtml).strip()
+        # truncate
+        if len(msg_nohtml) > max_len:
+            msg_nohtml = msg_nohtml[: max_len - 3] + "..."
+        return msg_nohtml
+    except Exception:
+        # fallback to truncated raw message
+        return (msg[: max_len - 3] + "...") if len(msg) > max_len else msg
 
 
 async def _ensure_exchange(name: str) -> Optional[ccxt.Exchange]:
     """
     Return a cached async ccxt exchange instance or create it.
-    If creation fails, return None.
     """
-    global _EXCHANGES_INST
     if name in _EXCHANGES_INST:
         return _EXCHANGES_INST[name]
     async with _ex_create_lock:
@@ -37,19 +68,14 @@ async def _ensure_exchange(name: str) -> Optional[ccxt.Exchange]:
         try:
             ex_cls = getattr(ccxt, name)
         except AttributeError:
-            logger.warning("Exchange %s not found in ccxt, skipping", name)
+            logger.debug("Exchange %s not found in ccxt, skipping", name)
             return None
         try:
             inst = ex_cls({
                 "enableRateLimit": True,
-                "timeout": max(REQUEST_TIMEOUT, 10) * 1000,
+                # ccxt expects timeout in ms
+                "timeout": max(REQUEST_TIMEOUT, 5) * 1000,
             })
-            # some exchanges require load_markets to be called once
-            try:
-                await inst.load_markets()
-            except Exception:
-                # some exchanges fail on load_markets in sandbox/dev; ignore here
-                logger.debug("load_markets failed for %s (ignored)", name, exc_info=True)
             _EXCHANGES_INST[name] = inst
             logger.info("Created exchange instance %s", name)
             return inst
@@ -62,9 +88,8 @@ async def close_all_exchanges():
     """
     Close and release all cached exchange instances.
     """
-    global _EXCHANGES_INST
     exs = list(_EXCHANGES_INST.items())
-    _EXCHANGES_INST = {}
+    _EXCHANGES_INST.clear()
     errs = []
     for name, inst in exs:
         try:
@@ -80,32 +105,146 @@ async def close_all_exchanges():
 def _make_candidate_pairs_for_exchange(exchange_name: str, override_pair: Optional[str]) -> List[str]:
     """
     Build priority list of pair strings to try for a given exchange.
-    override_pair: if provided, try only this and its variants first.
-    Uses PAIRS_ALTERNATIVES; falls back to DEFAULT_PAIR.
     """
     if override_pair:
-        # try override as-is first, then fallbacks in config
-        cand = []
-        cand.append(override_pair)
-        # if there is alt list for the exchange, append them
-        if exchange_name in PAIRS_ALTERNATIVES:
-            cand.extend(PAIRS_ALTERNATIVES[exchange_name])
-        # global star alternatives
+        cand: List[str] = [override_pair]
+        cand.extend(PAIRS_ALTERNATIVES.get(exchange_name, []))
         cand.extend(PAIRS_ALTERNATIVES.get("*", []))
-        # finally default
         cand.append(DEFAULT_PAIR)
-        # unique preserving order
-        seen = set()
-        out = []
+        seen = set(); out = []
         for p in cand:
             if p not in seen:
                 seen.add(p)
                 out.append(p)
         return out
-    # no override
-    if exchange_name in PAIRS_ALTERNATIVES:
-        return PAIRS_ALTERNATIVES[exchange_name] + PAIRS_ALTERNATIVES.get("*", []) + [DEFAULT_PAIR]
-    return PAIRS_ALTERNATIVES.get("*", []) + [DEFAULT_PAIR]
+    return PAIRS_ALTERNATIVES.get(exchange_name, []) + PAIRS_ALTERNATIVES.get("*", []) + [DEFAULT_PAIR]
+
+
+async def _ensure_markets(inst: ccxt.Exchange, type_hint: Optional[str] = None) -> None:
+    """
+    Load markets and cache them, preferring spot for exchanges with multi-market behavior.
+    Prevents OKX base/quote NoneType errors.
+    """
+    exid = inst.id.lower()
+    params: Dict[str, Any] = {}
+    if exid in ("okx", "bybit", "bitget", "gateio"):
+        # Prefer spot unless explicitly asked otherwise
+        params["type"] = type_hint or "spot"
+
+    try:
+        await inst.load_markets(params)
+    except Exception:
+        # fallback without params
+        await inst.load_markets()
+
+    _MARKETS_CACHE[inst.id] = inst.markets or {}
+
+
+def _safe_price_from_ticker(t: Mapping[str, Any]) -> Optional[float]:
+    """
+    Robust extraction of a numeric price from various ticker dict shapes.
+    """
+    if not t or not isinstance(t, Mapping):
+        return None
+
+    # common direct fields
+    for k in ("last", "lastPrice", "close", "price", "p"):
+        v = t.get(k)
+        if v is None:
+            continue
+        try:
+            val = float(str(v).replace(",", ".").strip())
+            if math.isfinite(val) and val > 0:
+                return val
+        except Exception:
+            continue
+
+    # nested info
+    info = t.get("info")
+    if isinstance(info, Mapping):
+        for k in ("last", "lastPrice", "close", "price"):
+            v = info.get(k)
+            if v is None:
+                continue
+            try:
+                val = float(str(v).replace(",", ".").strip())
+                if math.isfinite(val) and val > 0:
+                    return val
+            except Exception:
+                continue
+
+    # bid/ask average
+    bid = t.get("bid") or t.get("bestBid")
+    ask = t.get("ask") or t.get("bestAsk")
+    try:
+        if bid is not None and ask is not None:
+            val = (float(str(bid).replace(",", ".")) + float(str(ask).replace(",", "."))) / 2.0
+            if math.isfinite(val) and val > 0:
+                return val
+    except Exception:
+        pass
+
+    return None
+
+
+def _resolve_symbol(inst: ccxt.Exchange, canonical: str) -> Optional[str]:
+    """
+    Map canonical 'BASE/QUOTE' to an exchange-specific symbol present in inst.markets.
+    Handles OKX/HitBTC/LBank/Bybit/Bitget/Gate naming differences.
+    """
+    exid = inst.id.lower()
+    markets = _MARKETS_CACHE.get(inst.id) or inst.markets or {}
+    cache = _SYMBOL_MAP_CACHE.setdefault(inst.id, {})
+
+    if canonical in cache:
+        return cache[canonical]
+
+    # direct hit
+    if canonical in markets:
+        cache[canonical] = canonical
+        return canonical
+
+    base, quote = None, None
+    try:
+        base, quote = canonical.split("/")
+    except Exception:
+        # if canonical is not 'BASE/QUOTE', try to infer but prefer strict format in config
+        return None
+
+    candidates = set()
+
+    # Exchange-specific variants
+    if exid == "hitbtc":
+        candidates.update({f"{base}{quote}", canonical})
+    elif exid == "lbank":
+        candidates.update({
+            f"{base}_{quote}".lower(),
+            f"{base}{quote}".upper(),
+            f"{base}{quote}".lower(),
+            canonical
+        })
+    elif exid in ("bybit", "bitget", "gateio"):
+        candidates.update({canonical, f"{base}-{quote}"})
+    elif exid == "okx":
+        # OKX spot should be canonical; derivatives have suffixes; we want spot
+        candidates.update({canonical})
+
+    # test candidates against markets keys
+    for c in list(candidates):
+        if c in markets:
+            cache[canonical] = c
+            return c
+
+    # last-resort: search by base/quote inside market info (spot only)
+    for sym, info in markets.items():
+        try:
+            if (info.get("base") == base and info.get("quote") == quote and (info.get("type") or "spot") == "spot"):
+                cache[canonical] = sym
+                return sym
+        except Exception:
+            continue
+
+    return None
 
 
 async def _fetch_price_for_exchange(
@@ -114,72 +253,71 @@ async def _fetch_price_for_exchange(
     semaphore: asyncio.Semaphore,
 ) -> Optional[Tuple[str, float, str]]:
     """
-    Try to fetch ticker/price for the first pair that the exchange supports.
-    Returns tuple (label, price, used_pair) where label is 'EXCHANGE:PAIR' (uppercase exchange),
-    or None if no price could be fetched.
+    Try to fetch ticker/price for the first supported pair.
+    Returns (label, price, used_pair) where label is 'EXCHANGE:BASE/QUOTE'.
     """
     inst = await _ensure_exchange(exchange_name)
     if not inst:
         return None
 
+    # ensure markets loaded and cached
+    await _ensure_markets(inst, type_hint="spot")
+
     async with semaphore:
         for candidate in pair_candidates:
-            # ccxt expects symbol like "SUI/USDT" or "SUI/USDT:USDT" depending on exchange,
-            # try a few normalizations:
-            symbols_to_try = [candidate]
-            if "/" not in candidate and ":" not in candidate:
-                # maybe user passed "SUIUSDT" -> try with slash
-                symbols_to_try.append(f"{candidate[:3]}/{candidate[3:]}" if len(candidate) >= 6 else candidate)
-            # uppercase symbols
-            symbols_to_try = list(dict.fromkeys([s.upper() for s in symbols_to_try]))
+            # enforce canonical format 'BASE/QUOTE' for resolution
+            cand = candidate if "/" in candidate else f"{candidate[:3]}/{candidate[3:]}" if len(candidate) >= 6 else candidate
+            canonical = cand.upper()
 
-            for sym in symbols_to_try:
-                try:
-                    # use asyncio.wait_for to enforce per-request timeout (seconds)
-                    # REQUEST_TIMEOUT in config is seconds (int)
-                    timeout_s = max(1, int(REQUEST_TIMEOUT))
-                    res = await asyncio.wait_for(inst.fetch_ticker(sym), timeout=timeout_s)
-                    # fetch_ticker returns structure with 'last' or 'close'
-                    price = res.get("last") or res.get("close") or res.get("price") or None
-                    if price is None:
-                        # sometimes tickers have 'info' nested fields
-                        info = res.get("info", {})
-                        # try common fields
-                        price = info.get("lastPrice") or info.get("last") or info.get("price")
-                    if price is None:
-                        continue
-                    # build label using exchange uppercased
-                    label = f"{exchange_name.upper()}:{sym}"
-                    try:
-                        price_val = float(price)
-                    except Exception:
-                        continue
-                    logger.debug("Fetched %s -> %s from %s", sym, price_val, exchange_name)
-                    return label, price_val, sym
-                except asyncio.TimeoutError:
-                    logger.debug("Timeout fetching %s from %s", sym, exchange_name)
-                except ccxt.BaseError as e:
-                    # ccxt-specific errors: symbol not available, DDoS protection, etc.
-                    msg = str(e)
-                    # if it's symbol not found / not available, try next candidate
-                    logger.debug("ccxt error for %s@%s: %s", sym, exchange_name, msg)
-                except Exception:
-                    logger.exception("Unexpected error fetching %s from %s", sym, exchange_name)
-        # no candidate yielded price
+            # resolve to exchange-specific symbol
+            sym = _resolve_symbol(inst, canonical)
+            if not sym:
+                logger.debug("Symbol %s not found in markets for %s", canonical, exchange_name)
+                continue
+
+            # strict per-request timeout (seconds)
+            timeout_s = max(1, int(REQUEST_TIMEOUT))
+            ticker = None
+            try:
+                ticker = await asyncio.wait_for(inst.fetch_ticker(sym), timeout=timeout_s)
+            except asyncio.TimeoutError:
+                logger.debug("Timeout fetching %s from %s", sym, exchange_name)
+            except ccxt.DDoSProtection as e:
+                logger.warning("DDoS/Rate limit from %s when fetching %s: %s", exchange_name, sym, e)
+            except ccxt.NetworkError as e:
+                logger.debug("Network error fetching %s from %s: %s", sym, exchange_name, e)
+            except ccxt.ExchangeError as e:
+                # symbol not available, deprecated API, etc. — логируем в debug, чтобы не спамить
+                logger.debug("Exchange error for %s@%s: %s", sym, exchange_name, e)
+            except Exception:
+                # действительно неожиданные проблемы — поднимаем warning с трассой (или exception)
+                logger.exception("Unexpected error fetching %s from %s", sym, exchange_name)
+
+                continue
+
+            price = _safe_price_from_ticker(ticker) if ticker else None
+            if price is None:
+                logger.debug("No valid price from %s@%s; ticker=%s", sym, exchange_name, ticker)
+                continue
+
+            # label stays canonical for consistency
+            label = f"{exchange_name.upper()}:{canonical}"
+            logger.debug("Fetched %s -> %s from %s (api sym=%s)", canonical, price, exchange_name, sym)
+            return label, float(price), canonical
+
         logger.info("No supported pair found for exchange %s (tried %s)", exchange_name, pair_candidates)
         return None
 
 
 async def fetch_all_prices(pair_override: Optional[str] = None) -> Dict:
     """
-    Query all configured exchanges concurrently (bounded by MAX_CONCURRENT_REQUESTS)
-    and return:
+    Query all configured exchanges concurrently and return:
       {
-        "exchanges": [labels...],    # labels in same order as prices keys
+        "exchanges": [labels...],
         "prices": { label: price, ... },
         "mean": float|None
       }
-    label format: "EXCHANGE:PAIR" (e.g., "BINANCE:SUI/USDT")
+    label format: "EXCHANGE:BASE/QUOTE"
     """
     sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     tasks = []
@@ -192,35 +330,35 @@ async def fetch_all_prices(pair_override: Optional[str] = None) -> Dict:
     prices: Dict[str, float] = {}
     labels: List[str] = []
     for idx, res in enumerate(results):
-        # If the task raised or was cancelled, skip and log
         if isinstance(res, Exception):
-            # CancelledError is a subclass of Exception; handle explicitly for clarity
             if isinstance(res, asyncio.CancelledError):
                 logger.debug("fetch task %d was cancelled", idx)
             else:
-                logger.warning("Exception during fetch_all_prices task[%d]: %s", idx, res)
+                safe = _sanitize_error_message(res, max_len=240)
+                # логируем кратко; level warning только для неожиданных ошибок
+                logger.warning("fetch_all_prices task[%d] error: %s", idx, safe)
             continue
 
-        # valid successful result: unpack and record
+
+
         if not res:
             continue
+
         try:
             label, price_val, used_pair = res
         except Exception:
             logger.warning("Unexpected fetch task result format at idx %d: %r", idx, res)
             continue
 
-        # ensure unique labels
         if label in prices:
             logger.debug("Duplicate label %s, skipping", label)
             continue
-        prices[label] = price_val
+        prices[label] = float(price_val)
         labels.append(label)
 
-    mean = None
+    mean: Optional[float] = None
     if prices:
         vals = list(prices.values())
-        mean = float(sum(vals) / len(vals))
+        mean = float(sum(vals) / len(vals)) if vals else None
 
     return {"exchanges": labels, "prices": prices, "mean": mean}
-
