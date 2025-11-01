@@ -88,6 +88,39 @@ class Broadcaster:
 
 brdc = Broadcaster()
 
+import sqlite3
+
+DB_PATH = os.getenv("PAIRS_DB", "outputs/pairs.db")
+
+def _ensure_db(path: str = DB_PATH) -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    conn = sqlite3.connect(path, timeout=5, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS current_pairs (
+        pair TEXT PRIMARY KEY,
+        cheaper TEXT NOT NULL,
+        expensive TEXT NOT NULL,
+        percent REAL NOT NULL,
+        ts_ms INTEGER NOT NULL,
+        ts_iso TEXT NOT NULL
+    );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_current_pairs_ts ON current_pairs(ts_ms);")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pair TEXT NOT NULL,
+        cheaper TEXT NOT NULL,
+        expensive TEXT NOT NULL,
+        percent REAL NOT NULL,
+        ts_ms INTEGER NOT NULL,
+        ts_iso TEXT NOT NULL
+    );
+    """)
+    conn.commit()
+    return conn
 
 # Backward-compatible lightweight ConnectionManager (kept for other code paths)
 class ConnectionManager:
@@ -548,73 +581,106 @@ def _build_pair_rows_from_latest(latest: Dict[str, Dict], min_pct: float = 0.0) 
     rows.sort(key=lambda x: x[2], reverse=True)
     return rows
 
-async def csv_dumper_task(out_path: str = "outputs/pairs.csv",
-                          interval_ms: int = 200,
-                          min_pct: float = 0.0,
-                          stop_event: Optional[asyncio.Event] = None):
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+async def sqlite_dumper_task(out_db: str = DB_PATH,
+                             interval_ms: int = 200,
+                             min_pct: float = 0.0,
+                             stop_event: Optional[asyncio.Event] = None,
+                             write_history: bool = False):
+    conn = _ensure_db(out_db)
+    cur = conn.cursor()
     last_write_ts = 0.0
-    last_snapshot_hash: Optional[Tuple[int, Optional[Tuple[str, str, float]]]] = None
 
-    while True:
-        if stop_event and stop_event.is_set():
-            break
-        try:
+    try:
+        while True:
+            if stop_event and stop_event.is_set():
+                break
+
             now_ms = time.time() * 1000.0
-            # shallow copy of brdc.latest to avoid races
+
+            # source: prefer brdc.latest; fallback to _latest_payload.prices
             latest_copy: Dict[str, Dict] = {}
-            for lbl, info in brdc.latest.items():
-                try:
-                    latest_copy[lbl] = {
-                        "price": info.get("price"),
-                        "ts_source": info.get("ts_source"),
-                        "ts_server": info.get("ts_server"),
-                        "latency_exchange_ms": info.get("latency_exchange_ms"),
-                    }
-                except Exception:
-                    continue
+            if brdc.latest:
+                for lbl, info in brdc.latest.items():
+                    p = info.get("price")
+                    if p is None:
+                        continue
+                    try:
+                        latest_copy[lbl] = {"price": float(p)}
+                    except Exception:
+                        continue
+            else:
+                payload = globals().get("_latest_payload") or {}
+                prices = payload.get("prices") or {}
+                for lbl, val in prices.items():
+                    try:
+                        latest_copy[lbl] = {"price": float(val)}
+                    except Exception:
+                        continue
 
             rows = _build_pair_rows_from_latest(latest_copy, min_pct=min_pct)
-            snapshot_hash = (len(rows), rows[0] if rows else None)
 
-            if snapshot_hash != last_snapshot_hash and (now_ms - last_write_ts) >= interval_ms:
-                tmp = out_path + ".tmp"
-                with open(tmp, "w", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["ts_iso", "ts_ms", "cheaper", "expensive", "percent"])
-                    tsms = int(time.time() * 1000)
-                    ts_iso = datetime.utcfromtimestamp(tsms / 1000.0).isoformat() + "Z"
+            if (now_ms - last_write_ts) >= interval_ms:
+                tsms = int(time.time() * 1000)
+                tsiso = datetime.utcfromtimestamp(tsms / 1000.0).isoformat() + "Z"
+                with conn:
+                    # upsert snapshot
                     for cheaper, expensive, pct in rows:
-                        writer.writerow([ts_iso, tsms, cheaper, expensive, f"{pct:.6f}"])
-                os.replace(tmp, out_path)
-                last_write_ts = time.time() * 1000.0
-                last_snapshot_hash = snapshot_hash
-                logger.info("csv_dumper: wrote %d rows to %s", len(rows), out_path)
-        except Exception:
-            logger.exception("csv_dumper_task error")
-        await asyncio.sleep(max(0.05, interval_ms / 1000.0))
+                        pair_key = f"{cheaper}|{expensive}"
+                        conn.execute(
+                            "INSERT INTO current_pairs(pair, cheaper, expensive, percent, ts_ms, ts_iso) "
+                            "VALUES(?,?,?,?,?,?) "
+                            "ON CONFLICT(pair) DO UPDATE SET "
+                            "cheaper=excluded.cheaper, "
+                            "expensive=excluded.expensive, "
+                            "percent=excluded.percent, "
+                            "ts_ms=excluded.ts_ms, "
+                            "ts_iso=excluded.ts_iso",
+                            (pair_key, cheaper, expensive, float(pct), tsms, tsiso)
+                        )
+                    # optional history append
+                    if write_history and rows:
+                        conn.executemany(
+                            "INSERT INTO history(pair, cheaper, expensive, percent, ts_ms, ts_iso) VALUES(?,?,?,?,?,?)",
+                            [(f"{c}|{e}", c, e, float(p), tsms, tsiso) for c, e, p in rows]
+                        )
 
+                last_write_ts = time.time() * 1000.0
+                logger.debug("sqlite_dumper: wrote %d rows to %s", len(rows), out_db)
+
+
+            await asyncio.sleep(max(0.05, interval_ms / 1000.0))
+    except Exception:
+        logger.exception("sqlite_dumper_task error")
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
 
 @app.on_event("startup")
 async def on_startup():
     logger.info("Starting poll loop with interval %.2f s", POLL_INTERVAL_SECONDS)
 
-    # start poll loop fallback
     asyncio.create_task(poll_loop())
 
-    # start Redis stream consumer for minimal latency
     stop_evt = asyncio.Event()
     task = asyncio.create_task(stream_consumer_task(stop_evt))
     globals()["_stream_consumer_task"] = task
     globals()["_stream_consumer_stop"] = stop_evt
 
-    # start csv dumper task (ensure csv_dumper_task is defined earlier in file)
-    csv_stop = asyncio.Event()
-    csv_task = asyncio.create_task(csv_dumper_task(out_path="outputs/pairs.csv", interval_ms=200, min_pct=0.0, stop_event=csv_stop))
-    globals()["_csv_dumper_task"] = csv_task
-    globals()["_csv_dumper_stop"] = csv_stop
+    # start SQLite dumper
+    sqlite_stop = asyncio.Event()
+    sqlite_task = asyncio.create_task(sqlite_dumper_task(
+        out_db=DB_PATH,
+        interval_ms=200,
+        min_pct=0.0,
+        stop_event=sqlite_stop,
+        write_history=False  # set True if you want history table populated
+    ))
+    globals()["_sqlite_dumper_task"] = sqlite_task
+    globals()["_sqlite_dumper_stop"] = sqlite_stop
 
-    # ensure poll loop immediately emits at least one update to warm clients
     async def ensure_first_broadcast():
         await asyncio.sleep(0.1)
         last = globals().get("_latest_payload")
@@ -625,11 +691,11 @@ async def on_startup():
     asyncio.create_task(ensure_first_broadcast())
 
 
+
 @app.on_event("shutdown")
 async def on_shutdown():
     logger.info("Shutting down: closing exchange instances and stream consumer")
 
-    # stop stream consumer if running
     stop_evt = globals().get("_stream_consumer_stop")
     task = globals().get("_stream_consumer_task")
     if stop_evt and isinstance(stop_evt, asyncio.Event):
@@ -643,25 +709,25 @@ async def on_shutdown():
             except Exception:
                 pass
 
-    # stop csv dumper
-    csv_stop = globals().get("_csv_dumper_stop")
-    csv_task = globals().get("_csv_dumper_task")
-    if csv_stop and isinstance(csv_stop, asyncio.Event):
-        csv_stop.set()
-    if csv_task:
+    # stop SQLite dumper
+    sqlite_stop = globals().get("_sqlite_dumper_stop")
+    sqlite_task = globals().get("_sqlite_dumper_task")
+    if sqlite_stop and isinstance(sqlite_stop, asyncio.Event):
+        sqlite_stop.set()
+    if sqlite_task:
         try:
-            await asyncio.wait_for(csv_task, timeout=3.0)
+            await asyncio.wait_for(sqlite_task, timeout=3.0)
         except Exception:
             try:
-                csv_task.cancel()
+                sqlite_task.cancel()
             except Exception:
                 pass
 
-    # close ccxt exchanges
     try:
         await close_all_exchanges()
     except Exception:
         logger.exception("Error closing exchanges")
+
 
 
 
