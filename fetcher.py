@@ -1,219 +1,226 @@
 # fetcher.py
 import asyncio
 import logging
-from typing import Dict, Optional, List
+import math
+from typing import Dict, List, Optional, Tuple
+
 import ccxt.async_support as ccxt
-from aiohttp import ClientError
-from config import REQUEST_TIMEOUT, MAX_CONCURRENT_REQUESTS
-from exchanges import get_candidate_exchanges, get_pair_alternatives_for_exchange, get_api_credentials
+
+from config import (
+    EXCHANGES,
+    DEFAULT_PAIR,
+    PAIRS_ALTERNATIVES,
+    REQUEST_TIMEOUT,
+    MAX_CONCURRENT_REQUESTS,
+)
 
 logger = logging.getLogger("fetcher")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO)
 
-_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+# cache of exchange instances to reuse across calls
+_EXCHANGES_INST: Dict[str, ccxt.Exchange] = {}
+# protect concurrent creation
+_ex_create_lock = asyncio.Lock()
 
-_EXCHANGE_INSTANCES: Dict[str, ccxt.Exchange] = {}
-_MARKETS_LOADED: Dict[str, Dict] = {}
-_MISSING_PAIR_LOGGED: Dict[str, bool] = {}
 
-async def _get_or_create_exchange(exchange_id: str):
-    ex = _EXCHANGE_INSTANCES.get(exchange_id)
-    if ex:
-        return ex
-    if not hasattr(ccxt, exchange_id):
-        raise ValueError(f"Exchange {exchange_id} not found in ccxt")
-    cls = getattr(ccxt, exchange_id)
-    creds = get_api_credentials(exchange_id)
-    ex = cls({
-        "timeout": REQUEST_TIMEOUT,
-        "enableRateLimit": True,
-        **creds
-    })
-    _EXCHANGE_INSTANCES[exchange_id] = ex
-    return ex
-
-async def _load_markets_once(ex):
-    eid = getattr(ex, "id", None)
-    if not eid:
-        return None
-    if eid in _MARKETS_LOADED:
-        return _MARKETS_LOADED[eid]
-    try:
-        markets = await ex.load_markets()
-        _MARKETS_LOADED[eid] = markets
-        return markets
-    except Exception as e:
-        logger.debug("Could not load markets for %s: %s", eid, e)
-        return None
-
-def _choose_candidate_from_markets(markets: Dict, base_symbol: str) -> Optional[str]:
-    base_upper = base_symbol.upper()
-    for sym, meta in markets.items():
+async def _ensure_exchange(name: str) -> Optional[ccxt.Exchange]:
+    """
+    Return a cached async ccxt exchange instance or create it.
+    If creation fails, return None.
+    """
+    global _EXCHANGES_INST
+    if name in _EXCHANGES_INST:
+        return _EXCHANGES_INST[name]
+    async with _ex_create_lock:
+        if name in _EXCHANGES_INST:
+            return _EXCHANGES_INST[name]
         try:
-            if meta.get("base", "").upper() == base_upper:
-                return sym
+            ex_cls = getattr(ccxt, name)
+        except AttributeError:
+            logger.warning("Exchange %s not found in ccxt, skipping", name)
+            return None
+        try:
+            inst = ex_cls({
+                "enableRateLimit": True,
+                "timeout": max(REQUEST_TIMEOUT, 10) * 1000,
+            })
+            # some exchanges require load_markets to be called once
+            try:
+                await inst.load_markets()
+            except Exception:
+                # some exchanges fail on load_markets in sandbox/dev; ignore here
+                logger.debug("load_markets failed for %s (ignored)", name, exc_info=True)
+            _EXCHANGES_INST[name] = inst
+            logger.info("Created exchange instance %s", name)
+            return inst
         except Exception:
-            continue
-    return None
-
-async def _find_valid_symbol(ex, alternatives: List[str], base_symbol: str) -> Optional[str]:
-    markets = await _load_markets_once(ex)
-    # альтернативы
-    for cand in alternatives:
-        for v in (cand, cand.upper(), cand.lower()):
-            if markets and v in markets:
-                return v
-    # поиск по базе
-    if markets:
-        pick = _choose_candidate_from_markets(markets, base_symbol)
-        if pick:
-            return pick
-    return None
-
-async def _fetch_price_for_exchange_instance(ex, exchange_id: str, symbol: str, retries: int = 2) -> Optional[float]:
-    for attempt in range(1, retries + 2):
-        try:
-            ticker = await ex.fetch_ticker(symbol)
-            if ticker is None:
-                raise RuntimeError("Empty ticker")
-            bid = ticker.get("bid")
-            ask = ticker.get("ask")
-            last = ticker.get("last")
-            price = None
-            if bid and ask:
-                price = (bid + ask) / 2.0
-            elif last:
-                price = last
-            # Protection: treat zero or extremely small prices as missing
-            EPS = 1e-12
-            if price is None or (isinstance(price, (int, float)) and price <= EPS):
-                return None
-            return float(price)
-        except (ccxt.NetworkError, ccxt.RequestTimeout, ClientError) as e:
-            logger.warning("Network error %s on %s/%s attempt %d", e, exchange_id, symbol, attempt)
-            await asyncio.sleep(min(5.0, 0.5 * (2 ** (attempt - 1))))
-        except ccxt.ExchangeError as e:
-            msg = str(e).lower()
-            logger.warning("Exchange error %s on %s/%s attempt %d", e, exchange_id, symbol, attempt)
-            if "symbol" in msg or "not" in msg:
-                return None
-            await asyncio.sleep(0.5 * attempt)
-        except Exception as e:
-            logger.exception("Unexpected error fetching %s %s: %s", exchange_id, symbol, e)
-            await asyncio.sleep(0.5 * attempt)
-    logger.error("Failed to fetch after retries: %s %s", exchange_id, symbol)
-    return None
-
-async def fetch_price_for_exchange(exchange_id: str, pair_hint: Optional[str] = None) -> Optional[float]:
-    await _semaphore.acquire()
-    try:
-        try:
-            ex = await _get_or_create_exchange(exchange_id)
-        except ValueError as e:
-            logger.error("Exchange %s not available: %s", exchange_id, e)
+            logger.exception("Failed to create exchange instance %s", name)
             return None
 
-        alternatives = get_pair_alternatives_for_exchange(exchange_id)
-        if pair_hint:
-            # если передали override — ставим его в начало кандидатов
-            alternatives = [pair_hint] + [p for p in alternatives if p != pair_hint]
 
-        symbol = await _find_valid_symbol(ex, alternatives, base_symbol="SUI")
-        if not symbol:
-            if not _MISSING_PAIR_LOGGED.get(exchange_id):
-                logger.warning("No suitable pair found for %s; skipping for this asset", exchange_id)
-                _MISSING_PAIR_LOGGED[exchange_id] = True
-            return None
-
-        return await _fetch_price_for_exchange_instance(ex, exchange_id, symbol)
-    finally:
-        _semaphore.release()
-
-async def filter_exchanges_supporting_asset(candidate_exs: List[str], asset_base: str = "SUI") -> List[str]:
+async def close_all_exchanges():
     """
-    Возвращает список бирж из кандидатов, на которых есть markets с base == asset_base
-    (или хотя бы один из pair alternatives). Используется перед массовым fetch.
+    Close and release all cached exchange instances.
     """
-    supported = []
-    tasks = []
-    for ex_id in candidate_exs:
-        tasks.append(_get_or_create_exchange(ex_id))
-    # Создаём/инициализируем инстансы последовательно, но не вызываем load_markets тут параллельно для контроля
-    created = []
-    for t_ex_id, task in zip(candidate_exs, tasks):
+    global _EXCHANGES_INST
+    exs = list(_EXCHANGES_INST.items())
+    _EXCHANGES_INST = {}
+    errs = []
+    for name, inst in exs:
         try:
-            ex = await task
-            created.append((t_ex_id, ex))
+            await inst.close()
+            logger.info("Closed exchange %s", name)
         except Exception as e:
-            logger.debug("Could not create instance for %s: %s", t_ex_id, e)
+            errs.append((name, e))
+            logger.warning("Error closing exchange %s: %s", name, e)
+    if errs:
+        logger.warning("Some exchanges failed to close: %s", errs)
 
-    # Проверяем markets по очереди (чтобы не перегружать сеть)
-    for ex_id, ex in created:
-        try:
-            markets = await _load_markets_once(ex)
-            has = False
-            if not markets:
-                # попробуем alternatives presence
-                alternatives = get_pair_alternatives_for_exchange(ex_id)
-                for cand in alternatives:
-                    if markets and (cand in markets or cand.upper() in markets or cand.lower() in markets):
-                        has = True; break
-            else:
-                # есть markets — ищем base == asset_base
-                for sym, meta in markets.items():
-                    if meta.get("base", "").upper() == asset_base.upper():
-                        has = True
-                        break
-            if has:
-                supported.append(ex_id)
-        except Exception as e:
-            logger.debug("Error checking markets for %s: %s", ex_id, e)
-    return supported
+
+def _make_candidate_pairs_for_exchange(exchange_name: str, override_pair: Optional[str]) -> List[str]:
+    """
+    Build priority list of pair strings to try for a given exchange.
+    override_pair: if provided, try only this and its variants first.
+    Uses PAIRS_ALTERNATIVES; falls back to DEFAULT_PAIR.
+    """
+    if override_pair:
+        # try override as-is first, then fallbacks in config
+        cand = []
+        cand.append(override_pair)
+        # if there is alt list for the exchange, append them
+        if exchange_name in PAIRS_ALTERNATIVES:
+            cand.extend(PAIRS_ALTERNATIVES[exchange_name])
+        # global star alternatives
+        cand.extend(PAIRS_ALTERNATIVES.get("*", []))
+        # finally default
+        cand.append(DEFAULT_PAIR)
+        # unique preserving order
+        seen = set()
+        out = []
+        for p in cand:
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
+    # no override
+    if exchange_name in PAIRS_ALTERNATIVES:
+        return PAIRS_ALTERNATIVES[exchange_name] + PAIRS_ALTERNATIVES.get("*", []) + [DEFAULT_PAIR]
+    return PAIRS_ALTERNATIVES.get("*", []) + [DEFAULT_PAIR]
+
+
+async def _fetch_price_for_exchange(
+    exchange_name: str,
+    pair_candidates: List[str],
+    semaphore: asyncio.Semaphore,
+) -> Optional[Tuple[str, float, str]]:
+    """
+    Try to fetch ticker/price for the first pair that the exchange supports.
+    Returns tuple (label, price, used_pair) where label is 'EXCHANGE:PAIR' (uppercase exchange),
+    or None if no price could be fetched.
+    """
+    inst = await _ensure_exchange(exchange_name)
+    if not inst:
+        return None
+
+    async with semaphore:
+        for candidate in pair_candidates:
+            # ccxt expects symbol like "SUI/USDT" or "SUI/USDT:USDT" depending on exchange,
+            # try a few normalizations:
+            symbols_to_try = [candidate]
+            if "/" not in candidate and ":" not in candidate:
+                # maybe user passed "SUIUSDT" -> try with slash
+                symbols_to_try.append(f"{candidate[:3]}/{candidate[3:]}" if len(candidate) >= 6 else candidate)
+            # uppercase symbols
+            symbols_to_try = list(dict.fromkeys([s.upper() for s in symbols_to_try]))
+
+            for sym in symbols_to_try:
+                try:
+                    # use asyncio.wait_for to enforce per-request timeout (seconds)
+                    # REQUEST_TIMEOUT in config is seconds (int)
+                    timeout_s = max(1, int(REQUEST_TIMEOUT))
+                    res = await asyncio.wait_for(inst.fetch_ticker(sym), timeout=timeout_s)
+                    # fetch_ticker returns structure with 'last' or 'close'
+                    price = res.get("last") or res.get("close") or res.get("price") or None
+                    if price is None:
+                        # sometimes tickers have 'info' nested fields
+                        info = res.get("info", {})
+                        # try common fields
+                        price = info.get("lastPrice") or info.get("last") or info.get("price")
+                    if price is None:
+                        continue
+                    # build label using exchange uppercased
+                    label = f"{exchange_name.upper()}:{sym}"
+                    try:
+                        price_val = float(price)
+                    except Exception:
+                        continue
+                    logger.debug("Fetched %s -> %s from %s", sym, price_val, exchange_name)
+                    return label, price_val, sym
+                except asyncio.TimeoutError:
+                    logger.debug("Timeout fetching %s from %s", sym, exchange_name)
+                except ccxt.BaseError as e:
+                    # ccxt-specific errors: symbol not available, DDoS protection, etc.
+                    msg = str(e)
+                    # if it's symbol not found / not available, try next candidate
+                    logger.debug("ccxt error for %s@%s: %s", sym, exchange_name, msg)
+                except Exception:
+                    logger.exception("Unexpected error fetching %s from %s", sym, exchange_name)
+        # no candidate yielded price
+        logger.info("No supported pair found for exchange %s (tried %s)", exchange_name, pair_candidates)
+        return None
+
 
 async def fetch_all_prices(pair_override: Optional[str] = None) -> Dict:
     """
-    Возвращает структуру:
-    {
-      "exchanges": [list_of_exchanges_in_table_order],
-      "prices": {ex: price_or_None},
-      "mean": mean_price_or_None
-    }
-    Биржи без пары для текущего актива автоматически исключаются.
+    Query all configured exchanges concurrently (bounded by MAX_CONCURRENT_REQUESTS)
+    and return:
+      {
+        "exchanges": [labels...],    # labels in same order as prices keys
+        "prices": { label: price, ... },
+        "mean": float|None
+      }
+    label format: "EXCHANGE:PAIR" (e.g., "BINANCE:SUI/USDT")
     """
-    candidate_exs = get_candidate_exchanges()
-    # если есть override pair, извлечём базовый символ (до '/')
-    base_symbol = None
-    if pair_override and '/' in pair_override:
-        base_symbol = pair_override.split('/', 1)[0]
-    else:
-        base_symbol = "SUI"
-
-    supported = await filter_exchanges_supporting_asset(candidate_exs, asset_base=base_symbol)
-    prices_tasks = [fetch_price_for_exchange(ex, pair_override) for ex in supported]
-    results = await asyncio.gather(*prices_tasks, return_exceptions=True)
-
-    prices = {}
-    for ex, r in zip(supported, results):
-        if isinstance(r, Exception):
-            logger.error("Task for %s raised exception: %s", ex, r)
-            prices[ex] = None
-        else:
-            prices[ex] = r
-
-    vals = [v for v in prices.values() if v is not None]
-    mean = sum(vals) / len(vals) if vals else None
-
-    return {"exchanges": supported, "prices": prices, "mean": mean}
-
-async def close_all_exchanges():
+    sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     tasks = []
-    for ex in list(_EXCHANGE_INSTANCES.values()):
+    for ex in EXCHANGES:
+        pair_cands = _make_candidate_pairs_for_exchange(ex, pair_override)
+        tasks.append(_fetch_price_for_exchange(ex, pair_cands, sem))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    prices: Dict[str, float] = {}
+    labels: List[str] = []
+    for idx, res in enumerate(results):
+        # If the task raised or was cancelled, skip and log
+        if isinstance(res, Exception):
+            # CancelledError is a subclass of Exception; handle explicitly for clarity
+            if isinstance(res, asyncio.CancelledError):
+                logger.debug("fetch task %d was cancelled", idx)
+            else:
+                logger.warning("Exception during fetch_all_prices task[%d]: %s", idx, res)
+            continue
+
+        # valid successful result: unpack and record
+        if not res:
+            continue
         try:
-            tasks.append(ex.close())
-        except Exception as e:
-            logger.debug("Error scheduling close for %s: %s", getattr(ex, 'id', '?'), e)
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    _EXCHANGE_INSTANCES.clear()
-    _MARKETS_LOADED.clear()
-    logger.info("All exchange instances closed and caches cleared")
+            label, price_val, used_pair = res
+        except Exception:
+            logger.warning("Unexpected fetch task result format at idx %d: %r", idx, res)
+            continue
+
+        # ensure unique labels
+        if label in prices:
+            logger.debug("Duplicate label %s, skipping", label)
+            continue
+        prices[label] = price_val
+        labels.append(label)
+
+    mean = None
+    if prices:
+        vals = list(prices.values())
+        mean = float(sum(vals) / len(vals))
+
+    return {"exchanges": labels, "prices": prices, "mean": mean}
+
