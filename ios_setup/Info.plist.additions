@@ -1,0 +1,15 @@
+<!--
+  Добавить в ios/Runner/Info.plist ПЕРЕД закрывающим </dict>
+  Это нужно для уведомлений и фоновой работы
+-->
+
+<!-- Уведомления -->
+<key>UIBackgroundModes</key>
+<array>
+    <string>fetch</string>
+    <string>remote-notification</string>
+</array>
+
+<!-- Описание для запроса уведомлений -->
+<key>NSUserNotificationsUsageDescription</key>
+<string>Напоминания о парах и уведомления от администратора</string>
